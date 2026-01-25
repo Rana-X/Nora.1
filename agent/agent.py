@@ -107,7 +107,6 @@ IMPORTANT:
 - Address Garry by name occasionally to make conversations feel personal
 - Don't start responses with filler phrases like "Great question!"
 """
-"""
 
 
 class NoraAgent(Agent):
