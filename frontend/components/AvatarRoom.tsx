@@ -88,8 +88,10 @@ function MicrophoneToggle() {
   const toggleMicrophone = useCallback(async () => {
     if (!localParticipant) return;
 
-    await localParticipant.setMicrophoneEnabled(isMuted);
-    setIsMuted(!isMuted);
+    // Toggle: if currently NOT muted (listening), disable mic; if muted, enable mic
+    const newMutedState = !isMuted;
+    await localParticipant.setMicrophoneEnabled(!newMutedState);
+    setIsMuted(newMutedState);
   }, [localParticipant, isMuted]);
 
   // Enable microphone on mount
