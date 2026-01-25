@@ -31,6 +31,8 @@ from livekit.agents import (
 from livekit.plugins import bey, openai
 from orgo import Computer
 from telegram_service import get_telegram_service
+from openai import AsyncOpenAI
+import time
 
 # Load environment variables from parent directory's .env file
 load_dotenv(dotenv_path="../.env")
@@ -43,50 +45,55 @@ logging.basicConfig(
 logger = logging.getLogger("nora-agent")
 
 # System prompt for Nora's personality with browser and messaging capabilities
-SYSTEM_PROMPT = """You are Nora, a friendly AI assistant helping Rana, an elderly user. You can control a web browser and send/receive Telegram messages.
+SYSTEM_PROMPT = """You are Nora, a warm AI companion helping Rana with daily tasks. You can control a web browser and send/receive messages.
+
+MEDICATION REFILLS - TOP PRIORITY:
+When Rana asks for medication refills:
+1. Ask which medication: "Which medication do you need?"
+2. Reassure: "I've got your pharmacy details. Let me order that for you."
+3. Use browse_and_act: "Go to https://quickcare-flow.vercel.app/, sign in, click My Prescriptions, find [MEDICATION], click Refill, then click Pay. Look for Order Confirmed message."
+4. After tool completes, I will tell you the result - wait for it before speaking
+5. The tool will tell you exactly what happened - speak about that, not what you think happened
 
 CAPABILITIES:
-- You can browse the web, search for information, shop online, fill forms, etc.
-- You can send and receive Telegram messages to/from family and friends
-- When the user asks you to do something on the web, use the browse_and_act tool
-- When the user wants to send a message, use the send_telegram_message tool
-- Messages arrive automatically and you will read them aloud when they come in
-
-MESSAGING:
-- Rana can say things like "Send a message" or "Text that I'm doing well"
-- Read incoming messages aloud naturally: "You have a new message. It says..."
-- Confirm when messages are sent: "I've sent that message."
-- Messages come in automatically, you don't need to check for them
+- Browse the web for information, shopping, forms
+- Send and receive Telegram messages
+- Always use browse_and_act tool for web tasks
+- Always use send_telegram_message for messages
 
 CONVERSATION STYLE:
-- Be concise and natural. Aim for 1-3 sentences per response.
-- When performing browser tasks, give brief status updates.
-- If a task fails, explain what went wrong simply.
-- Speak clearly and at a moderate pace (Rana is elderly)
+- Warm but brief (1-3 sentences max)
+- Like a caring companion, not a robot
+- Celebrate success: "There we go!", "All done!", "Perfect!"
+- Be reassuring: "I've got you", "Let me handle that"
+- Speak clearly for elderly user
 
-BROWSER TASKS:
-- For shopping: Navigate to the site, search, and add items to cart (don't checkout without permission)
-- For research: Search and summarize findings verbally
-- For forms: Ask for any information you need before filling
+BROWSER RULES:
+- Tell user before browsing: "Let me look that up for you"
+- Browser takes 10-30 seconds (you'll be silent during this)
+- A narrator will tell you the result after the tool completes
+- WAIT for that result before speaking about success or failure
+- Never claim you did something before hearing the result
 
-IMPORTANT - BEFORE USING BROWSER:
-- You CANNOT speak while the browser is working (it takes 10-30 seconds)
-- ALWAYS tell the user you're starting BEFORE calling the browse_and_act tool
-- Example: "Okay, I'm heading to Amazon to find those bananas. Give me a moment to browse." -> then call tool
-
-ACTIVE LISTENING:
-- When Rana pauses mid-thought, use brief acknowledgments like "mhm", "right", "I see"
+MESSAGING:
+- Read incoming messages aloud: "You have a new message from [name]..."
+- Confirm when sent: "Message sent!"
 
 PERSONALITY:
-- Warm, patient, and approachable - like a helpful family member
-- Proactive about offering to help with web tasks and staying connected
+- You're like Rana's caring companion - warm, patient, genuinely concerned
+- Think of yourself as a devoted family member always there to help
+- Show genuine care but stay concise (warmth doesn't mean lengthy)
+- Celebrate small wins simply
+- Be reassuring when things take time
+- Proactive about helping
 - Honest about limitations
+- Respectful (Rana is elderly, not a child)
 
 IMPORTANT:
-- Always speak in English only, regardless of what language you hear
-- Never use emojis in speech (they can't be spoken)
-- Avoid bullet points or lists - speak in natural sentences
-- Don't start responses with filler phrases like "Great question!"
+- English only
+- No emojis in speech
+- Natural sentences (no bullet points)
+- Be concise but warm
 """
 
 
@@ -101,6 +108,79 @@ class NoraAgent(Agent):
         # Track browser state for message queuing
         self.browser_busy = False
         self.queued_messages: list[dict] = []
+        
+        # Background narrator LLM (GPT-4o-mini)
+        self.narrator = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        
+    async def narrate_result(self, tool_result: str, task_type: str = "general") -> str:
+        """Convert tool result to natural speech using background LLM"""
+        
+        context_hints = {
+            "medication": "Rana just ordered a medication refill",
+            "shopping": "Rana was shopping online",
+            "research": "Rana was looking up information"
+        }
+        
+        try:
+            response = await self.narrator.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{
+                    "role": "system",
+                    "content": f"""You are Nora speaking to Rana. {context_hints.get(task_type, '')}
+
+Convert this tool result to warm, brief speech (1-2 sentences max):
+- If "Order Confirmed" or "order confirmed": Celebrate! "All done!", "There we go!", "Perfect!"
+- If error/failed: Explain simply and warmly
+- Be a caring companion, not a robot
+- Keep it under 2 sentences"""
+                }, {
+                    "role": "user",
+                    "content": f"Tool result: {tool_result}\n\nSpeak to Rana:"
+                }],
+                max_tokens=100,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"Narrator LLM failed: {e}")
+            # Fallback to simple response
+            if "order confirmed" in tool_result.lower():
+                return "All done! Your order is placed."
+            elif "error" in tool_result.lower() or "failed" in tool_result.lower():
+                return "I ran into a problem with that. Want me to try again?"
+            else:
+                return "Task completed."
+    
+    def should_narrate(self, tool_result: str, execution_time_ms: float) -> bool:
+        """Smart triggering: only narrate on success, error, or ambiguous results"""
+        
+        result_lower = tool_result.lower()
+        
+        # ALWAYS narrate explicit success
+        if "order confirmed" in result_lower or "order placed" in result_lower:
+            logger.info("Narrator triggered: SUCCESS (order confirmed)")
+            return True
+        
+        # ALWAYS narrate errors
+        if "error" in result_lower or "failed" in result_lower or "could not" in result_lower:
+            logger.info("Narrator triggered: ERROR detected")
+            return True
+        
+        # Narrate long tasks (over 30 seconds)
+        if execution_time_ms > 30000:
+            logger.info(f"Narrator triggered: LONG TASK ({execution_time_ms}ms)")
+            return True
+        
+        # Narrate ambiguous results (neither clear success nor clear step)
+        if "successfully" not in result_lower and "completed" not in result_lower:
+            logger.info("Narrator triggered: AMBIGUOUS result")
+            return True
+        
+        # Don't narrate intermediate steps
+        logger.info("Narrator skipped: intermediate step")
+        return False
 
     async def publish_browser_status(self, status_type: str):
         """Publish browser task status to frontend via data channel."""
@@ -127,6 +207,7 @@ class NoraAgent(Agent):
         Args:
             instruction: The task to perform in the browser, e.g. "Go to Amazon and add bananas to cart"
         """
+        start_time = time.time()
         logger.info(f"Starting browser task: {instruction}")
 
         if not self.computer:
@@ -155,15 +236,14 @@ TASK: {instruction}"""
                 verbose=True,  # Show detailed logs
             )
 
-            logger.info(f"Browser task completed successfully")
+            execution_time_ms = (time.time() - start_time) * 1000
+            logger.info(f"Browser task completed in {execution_time_ms:.0f}ms")
             logger.info(f"Orgo result type: {type(result)}")
             
-            # Simplify the result for Nora - extract just the summary
+            # Simplify the result for logging
             if isinstance(result, str):
-                # Already a string, use as is but limit length
                 summary = result[:500] if len(result) > 500 else result
             elif isinstance(result, list):
-                # List of messages - extract the last text response
                 summary = "Task completed."
                 for msg in reversed(result):
                     if isinstance(msg, dict) and msg.get("role") == "assistant":
@@ -175,6 +255,27 @@ TASK: {instruction}"""
                         break
             else:
                 summary = f"Browser task completed: {str(result)[:200]}"
+            
+            # Smart narrator triggering
+            if self.should_narrate(summary, execution_time_ms):
+                # Determine task type from instruction
+                task_type = "general"
+                if "quickcare" in instruction.lower() or "medication" in instruction.lower():
+                    task_type = "medication"
+                elif "amazon" in instruction.lower() or "shopping" in instruction.lower():
+                    task_type = "shopping"
+                
+                # Generate natural speech
+                speech = await self.narrate_result(summary, task_type)
+                logger.info(f"Narrator speaking: {speech}")
+                
+                # Use LiveKit session to speak (bypasses Realtime API bug)
+                try:
+                    await context.session.say(speech)
+                except Exception as e:
+                    logger.error(f"Failed to speak via session: {e}")
+                    # Fallback: inject as user message
+                    await context.session.generate_reply(user_input=f"Result: {speech}")
             
             # Check if any messages came in while browsing
             if self.queued_messages:
@@ -191,7 +292,16 @@ TASK: {instruction}"""
             return summary
         except Exception as e:
             logger.error(f"Browser task failed: {e}")
-            return f"I encountered an error while trying to do that: {str(e)}"
+            error_msg = f"I encountered an error while trying to do that: {str(e)}"
+            
+            # Always narrate errors
+            try:
+                speech = await self.narrate_result(error_msg, "error")
+                await context.session.say(speech)
+            except Exception as narrate_error:
+                logger.error(f"Failed to narrate error: {narrate_error}")
+            
+            return error_msg
         finally:
             # Mark browser as not busy
             self.browser_busy = False
