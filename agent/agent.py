@@ -435,19 +435,30 @@ TASK: {instruction}"""
         def on_orgo_progress(event_type, event_data):
             nonlocal order_confirmed_announced
             
+            # Only check final text responses or results, not thinking/screenshots
+            # This prevents false positives from Claude describing stale browser state
+            if event_type not in ("text", "result"):
+                return
+            
             # Convert event data to string for checking
             event_str = str(event_data).lower()
             
-            # Only trigger on order confirmation - ignore everything else
+            # Only trigger on order confirmation with completion language
+            # Must contain "order confirmed" AND completion signals (not just observation)
             if not order_confirmed_announced and "order confirmed" in event_str:
-                order_confirmed_announced = True
-                logger.info("ORDER CONFIRMATION DETECTED via callback!")
-                
-                # Immediately announce to Garry (thread-safe)
-                def schedule_immediate_announcement():
-                    asyncio.create_task(self._announce_order_confirmed(context))
-                
-                loop.call_soon_threadsafe(schedule_immediate_announcement)
+                # Require completion language to distinguish actual completion from observation
+                completion_signals = ["successfully", "completed", "done", "placed", "confirmed!", "is on its way"]
+                if any(signal in event_str for signal in completion_signals):
+                    order_confirmed_announced = True
+                    logger.info("ORDER CONFIRMATION DETECTED via callback!")
+                    
+                    # Immediately announce to Garry (thread-safe)
+                    def schedule_immediate_announcement():
+                        asyncio.create_task(self._announce_order_confirmed(context))
+                    
+                    loop.call_soon_threadsafe(schedule_immediate_announcement)
+                else:
+                    logger.debug(f"Skipping observation: {event_str[:100]}")
         
         # Notify frontend that browser task is starting
         await self.publish_browser_status("browser_task_started")
