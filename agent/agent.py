@@ -425,6 +425,30 @@ TASK: {instruction}"""
         # Mark browser as busy - messages will be queued
         self.browser_busy = True
         
+        # Track if we've already announced the order confirmation
+        order_confirmed_announced = False
+        
+        # Get the event loop for thread-safe callback scheduling
+        loop = asyncio.get_event_loop()
+        
+        # Callback to detect order confirmation in real-time
+        def on_orgo_progress(event_type, event_data):
+            nonlocal order_confirmed_announced
+            
+            # Convert event data to string for checking
+            event_str = str(event_data).lower()
+            
+            # Only trigger on order confirmation - ignore everything else
+            if not order_confirmed_announced and "order confirmed" in event_str:
+                order_confirmed_announced = True
+                logger.info("ORDER CONFIRMATION DETECTED via callback!")
+                
+                # Immediately announce to Garry (thread-safe)
+                def schedule_immediate_announcement():
+                    asyncio.create_task(self._announce_order_confirmed(context))
+                
+                loop.call_soon_threadsafe(schedule_immediate_announcement)
+        
         # Notify frontend that browser task is starting
         await self.publish_browser_status("browser_task_started")
 
@@ -443,13 +467,14 @@ STEPS:
 
 REPORT: Tell me exactly what happened - did the order get confirmed?"""
 
-            # Use Orgo's hosted agent service for reliable execution
+            # Use Orgo's hosted agent service with callback for real-time detection
             result = await asyncio.to_thread(
                 self.computer.prompt,
                 instruction=pharmacy_instruction,
                 model="claude-sonnet-4-5-20250929",
                 max_iterations=30,
                 verbose=True,
+                callback=on_orgo_progress,  # Real-time order confirmation detection
             )
 
             execution_time_ms = (time.time() - start_time) * 1000
@@ -471,18 +496,21 @@ REPORT: Tell me exactly what happened - did the order get confirmed?"""
             else:
                 summary = f"Prescription refill completed: {str(result)[:200]}"
             
-            # Always narrate prescription results (important for Garry)
-            speech = await self.narrate_result(summary, "medication")
-            logger.info(f"Narrator speaking: {speech}")
-            
-            try:
-                speech_handle = await context.session.generate_reply(
-                    instructions=f"Tell Garry this result warmly and briefly: {speech}"
-                )
-                await speech_handle.wait_for_playout()
-                logger.info("Speech completed, starting 15-second display timer")
-            except Exception as e:
-                logger.error(f"Failed to speak via session: {e}")
+            # Only narrate if we haven't already announced via callback
+            if not order_confirmed_announced:
+                speech = await self.narrate_result(summary, "medication")
+                logger.info(f"Narrator speaking (fallback): {speech}")
+                
+                try:
+                    speech_handle = await context.session.generate_reply(
+                        instructions=f"Tell Garry this result warmly and briefly: {speech}"
+                    )
+                    await speech_handle.wait_for_playout()
+                    logger.info("Speech completed, starting 15-second display timer")
+                except Exception as e:
+                    logger.error(f"Failed to speak via session: {e}")
+            else:
+                logger.info("Skipping end-of-task narration - already announced via callback")
             
             # Check for queued messages
             if self.queued_messages:
@@ -522,6 +550,18 @@ REPORT: Tell me exactly what happened - did the order get confirmed?"""
             return error_msg
         finally:
             self.browser_busy = False
+    
+    async def _announce_order_confirmed(self, context: RunContext):
+        """Immediately announce order confirmation to Garry."""
+        try:
+            logger.info("Announcing order confirmation immediately via callback")
+            speech_handle = await context.session.generate_reply(
+                instructions="Tell Garry warmly and briefly: All done! Your prescription order is confirmed!"
+            )
+            await speech_handle.wait_for_playout()
+            logger.info("Order confirmation announcement completed")
+        except Exception as e:
+            logger.error(f"Failed to announce order confirmation: {e}")
 
 
 async def publish_vnc_credentials_with_retry(room, max_retries: int = 5, delay: float = 1.0):
