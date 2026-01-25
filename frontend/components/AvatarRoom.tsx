@@ -104,11 +104,10 @@ function MicrophoneToggle() {
   return (
     <button
       onClick={toggleMicrophone}
-      className={`flex items-center gap-2.5 px-5 py-3 rounded-full font-medium transition-all duration-300 backdrop-blur-md ${
-        isMuted
+      className={`flex items-center gap-2.5 px-5 py-3 rounded-full font-medium transition-all duration-300 backdrop-blur-md ${isMuted
           ? "bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30"
           : "bg-white/5 hover:bg-white/10 text-white/80 border border-white/10"
-      }`}
+        }`}
     >
       {isMuted ? (
         <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -208,6 +207,11 @@ function RoomContent({ onDisconnect }: { onDisconnect: () => void }) {
         } else if (data.type === 'browser_task_started') {
           setBrowserActive(true);
         } else if (data.type === 'browser_task_completed') {
+          // Task done, but keep browser visible until browser_can_hide
+          console.log("[DEBUG] Browser task completed, waiting for speech + 15s display");
+        } else if (data.type === 'browser_can_hide') {
+          // Now safe to hide - speech finished + 15s viewing time elapsed
+          console.log("[DEBUG] Hiding browser display");
           setBrowserActive(false);
         }
       } catch (e) {
@@ -254,11 +258,10 @@ function RoomContent({ onDisconnect }: { onDisconnect: () => void }) {
 
         {/* Avatar container with speaking glow */}
         <div
-          className={`transition-all duration-500 ease-out ${
-            browserActive
+          className={`transition-all duration-500 ease-out ${browserActive
               ? "absolute bottom-20 right-4 md:bottom-24 md:right-8 w-[180px] h-[180px] md:w-[240px] md:h-[240px] z-10"
               : "w-full max-w-3xl aspect-square md:aspect-video"
-          }`}
+            }`}
         >
           <div
             className={`

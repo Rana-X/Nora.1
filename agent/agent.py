@@ -282,13 +282,16 @@ TASK: {instruction}"""
                 speech = await self.narrate_result(summary, task_type)
                 logger.info(f"Narrator speaking: {speech}")
                 
-                # Use LiveKit session to speak (bypasses Realtime API bug)
+                # Use LiveKit session to speak and wait for completion
                 try:
-                    await context.session.say(speech)
+                    speech_handle = await context.session.generate_reply(
+                        instructions=f"Tell Garry this result warmly and briefly: {speech}"
+                    )
+                    # Wait for Nora to finish speaking
+                    await speech_handle.wait_for_playout()
+                    logger.info("Speech completed, starting 15-second display timer")
                 except Exception as e:
                     logger.error(f"Failed to speak via session: {e}")
-                    # Fallback: inject as user message
-                    await context.session.generate_reply(user_input=f"Result: {speech}")
             
             # Check if any messages came in while browsing
             if self.queued_messages:
@@ -302,6 +305,16 @@ TASK: {instruction}"""
                 summary += f"\n\nAlso, while I was browsing, you received {queued_count} new message(s): {' | '.join(message_texts)}"
                 logger.info(f"Announcing {queued_count} queued message(s) after browser task")
             
+            # Signal task completion (but don't hide browser yet)
+            await self.publish_browser_status("browser_task_completed")
+            
+            # Wait 15 seconds so Garry can see the result
+            await asyncio.sleep(15)
+            
+            # NOW tell frontend it can hide the browser
+            await self.publish_browser_status("browser_can_hide")
+            logger.info("Sent browser_can_hide after 15-second display")
+            
             return summary
         except Exception as e:
             logger.error(f"Browser task failed: {e}")
@@ -310,16 +323,22 @@ TASK: {instruction}"""
             # Always narrate errors
             try:
                 speech = await self.narrate_result(error_msg, "error")
-                await context.session.say(speech)
+                speech_handle = await context.session.generate_reply(
+                    instructions=f"Tell Garry about this problem gently: {speech}"
+                )
+                await speech_handle.wait_for_playout()
             except Exception as narrate_error:
                 logger.error(f"Failed to narrate error: {narrate_error}")
+            
+            # Signal error completion
+            await self.publish_browser_status("browser_task_completed")
+            await asyncio.sleep(15)
+            await self.publish_browser_status("browser_can_hide")
             
             return error_msg
         finally:
             # Mark browser as not busy
             self.browser_busy = False
-            # Always notify frontend that browser task is done
-            await self.publish_browser_status("browser_task_completed")
 
     @function_tool()
     async def take_screenshot(self, context: RunContext) -> str:
