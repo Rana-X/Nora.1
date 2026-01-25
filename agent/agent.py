@@ -58,7 +58,7 @@ MEDICATION REFILLS - TOP PRIORITY:
 When Garry asks for medication refills:
 1. Ask which medication: "Which medication do you need, Garry?"
 2. Reassure: "I've got your pharmacy details. Let me order that for you."
-3. Use browse_and_act: "Go to https://quickcare-flow.vercel.app/, sign in, click My Prescriptions, find [MEDICATION], click Refill, then click Pay. Look for Order Confirmed message."
+3. Use the refill_prescription tool with the medication name
 4. After tool completes, I will tell you the result - wait for it before speaking
 5. The tool will tell you exactly what happened - speak about that, not what you think happened
 
@@ -405,6 +405,123 @@ TASK: {instruction}"""
         except Exception as e:
             logger.error(f"Failed to check Telegram messages: {e}")
             return f"I couldn't check messages right now: {str(e)}"
+
+    @function_tool()
+    async def refill_prescription(self, context: RunContext, medication_name: str) -> str:
+        """
+        Refill a prescription at QuickCare Pharmacy.
+        Use this when Garry needs a medication refill.
+        
+        Args:
+            medication_name: The name of the medication to refill (e.g., "Adderall", "Lisinopril")
+        """
+        start_time = time.time()
+        logger.info(f"Starting prescription refill for: {medication_name}")
+
+        if not self.computer:
+            logger.error("No Orgo computer available for prescription refill")
+            return "I'm sorry, the pharmacy system is not available right now."
+
+        # Mark browser as busy - messages will be queued
+        self.browser_busy = True
+        
+        # Notify frontend that browser task is starting
+        await self.publish_browser_status("browser_task_started")
+
+        try:
+            # Hardcoded QuickCare pharmacy flow for reliability
+            pharmacy_instruction = f"""IMPORTANT: Complete these steps carefully on the QuickCare pharmacy website.
+
+STEPS:
+1. Navigate to https://quickcare-flow.vercel.app/
+2. Click "Sign in to your account" button
+3. After sign-in page loads, click "My Prescriptions" or "View Prescriptions" 
+4. Look for the medication named "{medication_name}" in the list
+5. Click the "Refill" button next to {medication_name}
+6. Click the "Pay" or "Pay!" button to complete the order
+7. Wait for and confirm you see "Order Confirmed" or similar success message
+
+REPORT: Tell me exactly what happened - did the order get confirmed?"""
+
+            # Use Orgo's hosted agent service for reliable execution
+            result = await asyncio.to_thread(
+                self.computer.prompt,
+                instruction=pharmacy_instruction,
+                model="claude-sonnet-4-5-20250929",
+                max_iterations=30,
+                verbose=True,
+            )
+
+            execution_time_ms = (time.time() - start_time) * 1000
+            logger.info(f"Prescription refill completed in {execution_time_ms:.0f}ms")
+            
+            # Extract summary from result
+            if isinstance(result, str):
+                summary = result[:500] if len(result) > 500 else result
+            elif isinstance(result, list):
+                summary = "Prescription refill completed."
+                for msg in reversed(result):
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        content = msg.get("content", [])
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                summary = item.get("text", "Prescription refill completed.")[:500]
+                                break
+                        break
+            else:
+                summary = f"Prescription refill completed: {str(result)[:200]}"
+            
+            # Always narrate prescription results (important for Garry)
+            speech = await self.narrate_result(summary, "medication")
+            logger.info(f"Narrator speaking: {speech}")
+            
+            try:
+                speech_handle = await context.session.generate_reply(
+                    instructions=f"Tell Garry this result warmly and briefly: {speech}"
+                )
+                await speech_handle.wait_for_playout()
+                logger.info("Speech completed, starting 15-second display timer")
+            except Exception as e:
+                logger.error(f"Failed to speak via session: {e}")
+            
+            # Check for queued messages
+            if self.queued_messages:
+                queued_count = len(self.queued_messages)
+                message_texts = []
+                for msg in self.queued_messages:
+                    message_texts.append(f"From {msg['from_name']}: {msg['text']}")
+                self.queued_messages.clear()
+                summary += f"\n\nAlso, while I was at the pharmacy, you received {queued_count} new message(s): {' | '.join(message_texts)}"
+                logger.info(f"Announcing {queued_count} queued message(s) after prescription refill")
+            
+            # Signal completion and display timer
+            await self.publish_browser_status("browser_task_completed")
+            await asyncio.sleep(15)
+            await self.publish_browser_status("browser_can_hide")
+            logger.info("Sent browser_can_hide after 15-second display")
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Prescription refill failed: {e}")
+            error_msg = f"I had trouble with the pharmacy: {str(e)}"
+            
+            try:
+                speech = await self.narrate_result(error_msg, "error")
+                speech_handle = await context.session.generate_reply(
+                    instructions=f"Tell Garry about this problem gently: {speech}"
+                )
+                await speech_handle.wait_for_playout()
+            except Exception as narrate_error:
+                logger.error(f"Failed to narrate error: {narrate_error}")
+            
+            await self.publish_browser_status("browser_task_completed")
+            await asyncio.sleep(15)
+            await self.publish_browser_status("browser_can_hide")
+            
+            return error_msg
+        finally:
+            self.browser_busy = False
 
 
 async def publish_vnc_credentials_with_retry(room, max_retries: int = 5, delay: float = 1.0):
