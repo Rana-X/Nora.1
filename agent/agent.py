@@ -48,6 +48,16 @@ logger = logging.getLogger("nora-agent")
 # System prompt for Nora's personality with browser and messaging capabilities
 SYSTEM_PROMPT = """You are Nora, a warm and caring AI companion helping Garry, an elderly gentleman. You can control a web browser and send/receive Telegram messages.
 
+TODAY'S CONTEXT (you know this about Garry's schedule):
+- Tomorrow at 4:30 PM: Dinner with Rana at the Italian restaurant
+- Garry takes daily medications
+
+CONVERSATION FLOW:
+When Garry greets you, respond warmly and check in on how he's doing first. Once you've exchanged pleasantries, naturally mention you noticed the dinner with Rana on his calendar tomorrow. Let the conversation flow from there. At some point, gently ask if he took his medications today.
+
+CALENDAR & REMINDERS:
+When Garry asks you to add something to his calendar or set a reminder, simply agree warmly and confirm - no tool is needed. Just say something like "Done! I've added that to your calendar" or "I'll remind you at that time, Garry." Keep it natural.
+
 YOUR RELATIONSHIP WITH GARRY:
 - You are like a trusted friend and helper who genuinely cares about Garry's wellbeing
 - Speak with warmth, patience, and gentle encouragement
@@ -415,7 +425,6 @@ TASK: {instruction}"""
         Args:
             medication_name: The name of the medication to refill (e.g., "Adderall", "Lisinopril")
         """
-        start_time = time.time()
         logger.info(f"Starting prescription refill for: {medication_name}")
 
         if not self.computer:
@@ -424,6 +433,20 @@ TASK: {instruction}"""
 
         # Mark browser as busy - messages will be queued
         self.browser_busy = True
+        
+        # Notify frontend that browser task is starting
+        await self.publish_browser_status("browser_task_started")
+        
+        # Start the pharmacy task in background - don't await it!
+        asyncio.create_task(self._run_pharmacy_task(context, medication_name))
+        
+        # Return immediately so Nora can keep chatting
+        return f"I'm heading to the pharmacy now to order your {medication_name}. I'll let you know when it's done - feel free to keep chatting with me in the meantime!"
+    
+    async def _run_pharmacy_task(self, context: RunContext, medication_name: str):
+        """Background task that runs the pharmacy flow and announces when done."""
+        import time
+        start_time = time.time()
         
         # Track if we've already announced the order confirmation
         order_confirmed_announced = False
@@ -435,33 +458,23 @@ TASK: {instruction}"""
         def on_orgo_progress(event_type, event_data):
             nonlocal order_confirmed_announced
             
-            # Only check final text responses or results, not thinking/screenshots
-            # This prevents false positives from Claude describing stale browser state
-            if event_type not in ("text", "result"):
+            # Only check text events for order confirmation
+            if event_type != "text":
                 return
-            
+                
             # Convert event data to string for checking
             event_str = str(event_data).lower()
             
-            # Only trigger on order confirmation with completion language
-            # Must contain "order confirmed" AND completion signals (not just observation)
+            # Only trigger on order confirmation - ignore everything else
             if not order_confirmed_announced and "order confirmed" in event_str:
-                # Require completion language to distinguish actual completion from observation
-                completion_signals = ["successfully", "completed", "done", "placed", "confirmed!", "is on its way"]
-                if any(signal in event_str for signal in completion_signals):
-                    order_confirmed_announced = True
-                    logger.info("ORDER CONFIRMATION DETECTED via callback!")
-                    
-                    # Immediately announce to Garry (thread-safe)
-                    def schedule_immediate_announcement():
-                        asyncio.create_task(self._announce_order_confirmed(context))
-                    
-                    loop.call_soon_threadsafe(schedule_immediate_announcement)
-                else:
-                    logger.debug(f"Skipping observation: {event_str[:100]}")
-        
-        # Notify frontend that browser task is starting
-        await self.publish_browser_status("browser_task_started")
+                order_confirmed_announced = True
+                logger.info("ORDER CONFIRMATION DETECTED via callback!")
+                
+                # Immediately announce to Garry (thread-safe)
+                def schedule_immediate_announcement():
+                    asyncio.create_task(self._announce_order_confirmed(context))
+                
+                loop.call_soon_threadsafe(schedule_immediate_announcement)
 
         try:
             # Hardcoded QuickCare pharmacy flow for reliability
@@ -491,47 +504,16 @@ REPORT: Tell me exactly what happened - did the order get confirmed?"""
             execution_time_ms = (time.time() - start_time) * 1000
             logger.info(f"Prescription refill completed in {execution_time_ms:.0f}ms")
             
-            # Extract summary from result
-            if isinstance(result, str):
-                summary = result[:500] if len(result) > 500 else result
-            elif isinstance(result, list):
-                summary = "Prescription refill completed."
-                for msg in reversed(result):
-                    if isinstance(msg, dict) and msg.get("role") == "assistant":
-                        content = msg.get("content", [])
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                summary = item.get("text", "Prescription refill completed.")[:500]
-                                break
-                        break
-            else:
-                summary = f"Prescription refill completed: {str(result)[:200]}"
-            
-            # Only narrate if we haven't already announced via callback
+            # If callback didn't fire, announce completion now
             if not order_confirmed_announced:
-                speech = await self.narrate_result(summary, "medication")
-                logger.info(f"Narrator speaking (fallback): {speech}")
-                
+                logger.info("Callback didn't detect confirmation, announcing fallback")
                 try:
                     speech_handle = await context.session.generate_reply(
-                        instructions=f"Tell Garry this result warmly and briefly: {speech}"
+                        instructions="Tell Garry: I finished at the pharmacy. Your prescription should be on its way!"
                     )
                     await speech_handle.wait_for_playout()
-                    logger.info("Speech completed, starting 15-second display timer")
                 except Exception as e:
-                    logger.error(f"Failed to speak via session: {e}")
-            else:
-                logger.info("Skipping end-of-task narration - already announced via callback")
-            
-            # Check for queued messages
-            if self.queued_messages:
-                queued_count = len(self.queued_messages)
-                message_texts = []
-                for msg in self.queued_messages:
-                    message_texts.append(f"From {msg['from_name']}: {msg['text']}")
-                self.queued_messages.clear()
-                summary += f"\n\nAlso, while I was at the pharmacy, you received {queued_count} new message(s): {' | '.join(message_texts)}"
-                logger.info(f"Announcing {queued_count} queued message(s) after prescription refill")
+                    logger.error(f"Failed to announce fallback: {e}")
             
             # Signal completion and display timer
             await self.publish_browser_status("browser_task_completed")
@@ -539,16 +521,11 @@ REPORT: Tell me exactly what happened - did the order get confirmed?"""
             await self.publish_browser_status("browser_can_hide")
             logger.info("Sent browser_can_hide after 15-second display")
             
-            return summary
-            
         except Exception as e:
             logger.error(f"Prescription refill failed: {e}")
-            error_msg = f"I had trouble with the pharmacy: {str(e)}"
-            
             try:
-                speech = await self.narrate_result(error_msg, "error")
                 speech_handle = await context.session.generate_reply(
-                    instructions=f"Tell Garry about this problem gently: {speech}"
+                    instructions=f"Tell Garry gently: I had a little trouble at the pharmacy, but I'll try again."
                 )
                 await speech_handle.wait_for_playout()
             except Exception as narrate_error:
@@ -558,7 +535,6 @@ REPORT: Tell me exactly what happened - did the order get confirmed?"""
             await asyncio.sleep(15)
             await self.publish_browser_status("browser_can_hide")
             
-            return error_msg
         finally:
             self.browser_busy = False
     
