@@ -1,0 +1,43 @@
+sttm
+
+"Database Name +
+Schema Name"	Table Name	"Column Name
+highlighted cols need code updates"	Business Name	Data Desription	Data Type	"Primary Key
+(Y/N)"	"Nullable
+(Y/N)"	Valid Values / Pattern	Sample	Notes	Source Sytem	Source Path/Attibute	ETL Transformation
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	air_wb_prfx_id	AirWayBill Prefix	Identifies the Cargo Carrier (i.e. 526 for SWA)	bpchar(3)	Y	N	"-": default	526		CTDS CARGO Kafka V2 Topic	body.commodityPK.airWaybillPrefix	"Direct map from source if not null/not blank.
+Otherwise default to ""-"""
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	air_wb_num	AirWayBill Number	"AWB Number (identifier) - 7-digit serial number + check digit*
+
+*The check digit is derived by dividing the 7 digit Serial Number by 7. The remainder determines the Check Digit.
+ Example: Serial Number 8114074 divided by 7 is 1159153 with remainder 3.  To easily calculate the remainder you can divide the 7 figures by 7, then subtract it with its integer, i.e. 8114074 divided by 7 = 1159153.428571429; 1159153.428571429 - 1159153 = 0.428571429; multiply the result by 7 and you will get the check digit by rounding it up or down to its closest integer. Here 0.428571429 x 7 = 3,000.... therefore the Serial Number + Check Digit is 81140743.
+
+"	bpchar(8)	Y	N	"-": default	32234823		CTDS CARGO Kafka V2 Topic	body.commodityPK.airWaybillNumber	"Direct map from source if not null/not blank.
+Otherwise default to ""-"""
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	air_wb_cre_dt	AirWayBill Creation Date	AWB Create Date - AWB was created/ingested within the Commodity Tracking System 	date	Y	N	YYYY-MM-DD	2025-09-05		CTDS CARGO Kafka V2 Topic	body.commodityPK.airWaybillCreationDate	"Given source data in format of 'YYYY-MM-DDTHH:MM:SS.sss±hh:mm' then parse and load YYYY-MM-DD from source.
+Default value is high date."
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	air_wb_cre_h2si	AirWayBill Creation Timestamp	AWB Create Hour To Second Interval of when the AWB was created/ingested within the Commodity Tracking Domain Services (CTDS).	vchar(64)	Y	N	HH:mm:ss.SSS	05:01:52.015		CTDS CARGO Kafka V2 Topic	body.commodityPK.airWaybillCreationDate	"Given source data in format of 'YYYY-MM-DDTHH:MM:SS.sss±hh:mm' then parse and load HH:MM:SS.sss from source.
+Default value is 00:00:00.000"
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	air_wb_pce_num	AirWayBill Piece Number	Sequence number within an AWB	int2	Y	N		8		CTDS CARGO Kafka V2 Topic	body.commodityPK.airWaybillPieceNumber	"Direct map from source if not null/not blank.
+Otherwise default to ""0"""
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	pln_crgo_leg_seq_num	Planned Cargo Flight Leg Sequence Num	Plan Cargo Leg Sequence (order) within the Cargo Planned Itinerary (Trip)	int2	Y	N				CTDS CARGO Kafka V2 Topic	body.plannedItinerary.flightLeg[]	"Sequentially assgin the count for each plannedItinerary.flightLeg[]
+Default value is ""0""
+Example: First flight leg in Planned Itinerary will have the value = 1, next flight leg in Planned Iternary will have the value = 2 and so on…"
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	opng_carr_cde	Operating Carrier Code	Carrier Operating the Flight	bpchar(3)	Y	N				CTDS CARGO Kafka V2 Topic	plannedItinerary.flightLeg[].operationalCarrier	"1. Take the operationalCarrier from the exploded plannedItinerary.flightLeg
+2. Use the value directly if it's not null
+3. Default to '-' if the field is null or missing"
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	opng_flt_num	Operating Flight Number	Operating Flight Number	int2	Y	N				CTDS CARGO Kafka V2 Topic	plannedItinerary.flightLeg[].flightNumber	"1. Take the flightNumber from the exploded plannedItinerary.flightLeg
+2. If the flight number is 4+ characters long, takes only the first 4 characters
+3. Otherwise use the full flight number as-is
+4. Default to '0' if field is null/blank"
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	opng_flt_num_sufx_txt	Operating Flight Suffix Code	Operational Flight Number Suffix Txt defaulted as  -	bpchar(1)	Y	N				CTDS CARGO Kafka V2 Topic	plannedItinerary.flightLeg[].operationalSuffix	"1. Take the operationalSuffix from the exploded plannedItinerary.flightLeg
+2. If opperationalSuffix is 2+ characters long, take only the first character
+3. Otherwise use the operationalSuffix as-is
+4. Default to '-' if null/empty/blank"
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	flt_dep_dt	Flight Departure Date	Flight Departure Date (Local)	date	Y	N				CTDS CARGO Kafka V2 Topic	plannedItinerary.flightLeg[].originDate	"1. Take the originDate from the exploded plannedItinerary.flightLeg
+2. Convert it to a DATE type
+3. Use the value if not null
+4. Otherwise default to None"
+swadb.idw_vw	CMDTY_CRGO_PLN_LEG	leg_orig_arpt_cde	Flight Leg Origination Airport Code	Flight Leg Orig (Departure) Airport -- IATA-compliant departure station code.	bpchar(3)	Y	N				CTDS CARGO Kafka V2 Topic	plannedItinerary.flightLeg[].departureAirportIataCode	"1. Take the departureAirportIataCode from the exploded plannedItinerary.flightLeg
+2. Use the value directly if it's not null
+3. Default to '-' if the field is null or missing"
