@@ -15,10 +15,22 @@
 --   * uncomment + adjust the year/month/day partition filters in BOTH the
 --     'source' and 'actual' CTEs (full scans are slow and expensive)
 --
--- Output: one row per mismatch
---   diff_type = 'missing_in_dev' -> derived from source, absent in dev table
---   diff_type = 'extra_in_dev'   -> present in dev table, not re-derivable
---   Empty result = the dev table matches the source-derived data exactly.
+-- Output: ONE summary row
+--   source_count       -> rows re-derived from the curated source (expected)
+--   target_count       -> rows in the dev Athena table (actual)
+--   matched_on_keys    -> rows joined 1:1 on the business keys
+--   missing_in_target  -> source-derived keys with no row in the dev table
+--   extra_in_target    -> dev-table keys that could not be re-derived
+--   mismatch_<field>   -> per field: +1 for every key-matched row where the
+--                         source-derived value differs from the dev value
+--                         (0 everywhere = perfect match)
+--
+-- Rows are matched on the schema's business/primary keys (KEYS_PRIMARY):
+--   air_wb_prfx_id, air_wb_num, air_wb_cre_dt, air_wb_cre_h2si,
+--   air_wb_pce_num, opng_carr_cde, opng_flt_num, opng_flt_num_sufx_txt,
+--   flt_dep_dt, leg_orig_arpt_cde, leg_dest_arpt_cde
+-- plus eff_fm_cent_tz, because the datalake table keeps one row per event
+-- version; without it the join would multiply versions against each other.
 -- ============================================================================
 
 WITH
@@ -166,32 +178,79 @@ actual AS (
 ),
 
 -- ----------------------------------------------------------------------------
--- 3b) VALIDATE: full-row diff in both directions
+-- 3b) JOIN source-derived rows to dev rows on the business keys
 -- ----------------------------------------------------------------------------
-missing_in_dev AS (
-    SELECT * FROM expected
-    EXCEPT
-    SELECT * FROM actual
-),
-extra_in_dev AS (
-    SELECT * FROM actual
-    EXCEPT
-    SELECT * FROM expected
+joined AS (
+    SELECT
+        (s.air_wb_prfx_id IS NOT NULL) AS s_present,
+        (t.air_wb_prfx_id IS NOT NULL) AS t_present,
+        s.pln_crgo_leg_seq_num         AS s_pln_crgo_leg_seq_num,
+        t.pln_crgo_leg_seq_num         AS t_pln_crgo_leg_seq_num,
+        s.pln_max_crgo_leg_seq_num     AS s_pln_max_crgo_leg_seq_num,
+        t.pln_max_crgo_leg_seq_num     AS t_pln_max_crgo_leg_seq_num,
+        s.pln_crgo_dep_ld_flag         AS s_pln_crgo_dep_ld_flag,
+        t.pln_crgo_dep_ld_flag         AS t_pln_crgo_dep_ld_flag,
+        s.pln_crgo_arr_unld_flag       AS s_pln_crgo_arr_unld_flag,
+        t.pln_crgo_arr_unld_flag       AS t_pln_crgo_arr_unld_flag,
+        s.cmdty_flt_leg_type_cde       AS s_cmdty_flt_leg_type_cde,
+        t.cmdty_flt_leg_type_cde       AS t_cmdty_flt_leg_type_cde
+    FROM expected s
+    FULL OUTER JOIN actual t
+        ON  s.air_wb_prfx_id        = t.air_wb_prfx_id
+        AND s.air_wb_num            = t.air_wb_num
+        AND s.air_wb_cre_dt         = t.air_wb_cre_dt
+        AND s.air_wb_cre_h2si       = t.air_wb_cre_h2si
+        AND s.air_wb_pce_num        = t.air_wb_pce_num
+        AND s.opng_carr_cde         = t.opng_carr_cde
+        AND s.opng_flt_num          = t.opng_flt_num
+        AND s.opng_flt_num_sufx_txt = t.opng_flt_num_sufx_txt
+        AND s.flt_dep_dt            = t.flt_dep_dt
+        AND s.leg_orig_arpt_cde     = t.leg_orig_arpt_cde
+        AND s.leg_dest_arpt_cde     = t.leg_dest_arpt_cde
+        AND s.eff_fm_cent_tz IS NOT DISTINCT FROM t.eff_fm_cent_tz
 )
 
-SELECT 'missing_in_dev' AS diff_type, * FROM missing_in_dev
-UNION ALL
-SELECT 'extra_in_dev'   AS diff_type, * FROM extra_in_dev
-ORDER BY air_wb_prfx_id, air_wb_num, air_wb_cre_dt, air_wb_cre_h2si,
-         air_wb_pce_num, pln_crgo_leg_seq_num, diff_type;
+-- ----------------------------------------------------------------------------
+-- 3c) VALIDATE: one summary row. Per non-key field: +1 per key-matched row
+--     where source-derived and dev values differ, +0 when they match.
+--     IS DISTINCT FROM counts NULL vs non-NULL as a mismatch, NULL vs NULL
+--     as a match.
+-- ----------------------------------------------------------------------------
+SELECT
+    (SELECT count(*) FROM expected)                  AS source_count,
+    (SELECT count(*) FROM actual)                    AS target_count,
+    count_if(s_present AND t_present)                AS matched_on_keys,
+    count_if(s_present AND NOT t_present)            AS missing_in_target,
+    count_if(NOT s_present AND t_present)            AS extra_in_target,
+    sum(CASE WHEN s_present AND t_present
+              AND s_pln_crgo_leg_seq_num     IS DISTINCT FROM t_pln_crgo_leg_seq_num
+             THEN 1 ELSE 0 END)                      AS mismatch_pln_crgo_leg_seq_num,
+    sum(CASE WHEN s_present AND t_present
+              AND s_pln_max_crgo_leg_seq_num IS DISTINCT FROM t_pln_max_crgo_leg_seq_num
+             THEN 1 ELSE 0 END)                      AS mismatch_pln_max_crgo_leg_seq_num,
+    sum(CASE WHEN s_present AND t_present
+              AND s_pln_crgo_dep_ld_flag     IS DISTINCT FROM t_pln_crgo_dep_ld_flag
+             THEN 1 ELSE 0 END)                      AS mismatch_pln_crgo_dep_ld_flag,
+    sum(CASE WHEN s_present AND t_present
+              AND s_pln_crgo_arr_unld_flag   IS DISTINCT FROM t_pln_crgo_arr_unld_flag
+             THEN 1 ELSE 0 END)                      AS mismatch_pln_crgo_arr_unld_flag,
+    sum(CASE WHEN s_present AND t_present
+              AND s_cmdty_flt_leg_type_cde   IS DISTINCT FROM t_cmdty_flt_leg_type_cde
+             THEN 1 ELSE 0 END)                      AS mismatch_cmdty_flt_leg_type_cde
+FROM joined;
 
 
 -- ============================================================================
--- OPTIONAL: quick summary instead of the row-level diff. Swap the final
--- SELECT above for this block to get just the counts.
+-- OPTIONAL: row-level drill-down. Once the summary above shows a non-zero
+-- counter, swap the final SELECT for this EXCEPT diff to see the actual
+-- offending rows (keep the CTEs as-is; 'joined' becomes unused).
 -- ============================================================================
--- SELECT
---     (SELECT count(*) FROM expected)                       AS expected_cnt,
---     (SELECT count(*) FROM actual)                         AS dev_cnt,
---     (SELECT count(*) FROM missing_in_dev)                 AS missing_in_dev_cnt,
---     (SELECT count(*) FROM extra_in_dev)                   AS extra_in_dev_cnt;
+-- SELECT 'missing_in_dev' AS diff_type, * FROM (
+--     SELECT * FROM expected EXCEPT SELECT * FROM actual
+-- )
+-- UNION ALL
+-- SELECT 'extra_in_dev' AS diff_type, * FROM (
+--     SELECT * FROM actual EXCEPT SELECT * FROM expected
+-- )
+-- ORDER BY air_wb_prfx_id, air_wb_num, air_wb_cre_dt, air_wb_cre_h2si,
+--          air_wb_pce_num, pln_crgo_leg_seq_num, diff_type;
