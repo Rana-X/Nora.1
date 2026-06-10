@@ -9,11 +9,13 @@
 --        2) TRANSFORM - explode plannedItinerary and derive the leg columns
 --        3) VALIDATE  - EXCEPT-diff against the dev table in both directions
 --
--- Before running:
---   * replace <SOURCE_DB> with the curated database (e.g. datalake_dev1_xmpl)
---   * replace <TARGET_DB> with the database holding cmdty_crgo_pln_leg
---   * uncomment + adjust the year/month/day partition filters in BOTH the
---     'source' and 'actual' CTEs (full scans are slow and expensive)
+-- Tables:
+--   source: datalake_qa1_entp_ctds.cmdty_crgo_curated
+--   dev   : datalake_qa1_entp_ctds.cmdty_crgo_pln_leg
+--
+-- Before running: adjust the AWB-creation-date window in BOTH the 'source'
+-- and 'actual' CTEs (filtering is on air_wb_cre_dt / airwaybillcreationdate,
+-- not on year/month/day partition columns) - full scans are slow and costly
 --
 -- Output: ONE summary row
 --   source_count       -> rows re-derived from the curated source (expected)
@@ -47,7 +49,7 @@ source AS (
         airwaybillpiecenumber,
         event_created,
         planneditinerary
-    FROM <SOURCE_DB>.cmdty_crgo_curated
+    FROM datalake_qa1_entp_ctds.cmdty_crgo_curated
     WHERE event_name IN (
         'piece-created', 'piece-itinerary-changed', 'piece-wab-added',
         'piece-wab-changed', 'piece-loaded-on-flight', 'piece-unloaded-from-flight',
@@ -57,8 +59,10 @@ source AS (
     )
     AND planneditinerary IS NOT NULL
     AND cardinality(planneditinerary) > 0
-    -- partition pruning (keep in sync with 'actual' below):
-    -- AND year = '2025' AND month = '09' AND day = '05'
+    -- AWB creation date window (keep in sync with 'actual' below);
+    -- airwaybillcreationdate is a string like 'YYYY-MM-DDTHH:MM:SS.sss±hh:mm'
+    AND TRY(CAST(substr(airwaybillcreationdate, 1, 10) AS date))
+        BETWEEN DATE '2025-09-01' AND DATE '2025-09-30'
 ),
 
 -- ----------------------------------------------------------------------------
@@ -172,9 +176,9 @@ actual AS (
         pln_crgo_dep_ld_flag,
         pln_crgo_arr_unld_flag,
         cmdty_flt_leg_type_cde
-    FROM <TARGET_DB>.cmdty_crgo_pln_leg
-    -- partition pruning (keep in sync with 'source' above):
-    -- WHERE year = '2025' AND month = '09' AND day = '05'
+    FROM datalake_qa1_entp_ctds.cmdty_crgo_pln_leg
+    -- AWB creation date window (keep in sync with 'source' above):
+    WHERE air_wb_cre_dt BETWEEN DATE '2025-09-01' AND DATE '2025-09-30'
 ),
 
 -- ----------------------------------------------------------------------------
