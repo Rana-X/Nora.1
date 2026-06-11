@@ -1,45 +1,27 @@
-"""cmdty_crgo_pln_leg validation - one big Spark SQL query (Athena Spark / Glue).
-
-Same source -> transform -> compare flow as cmdty_crgo_pln_leg_validation.sql,
-written as ONE SQL query (CTE style) executed with spark.sql(). Because it
-runs on Spark, it uses the EXACT engine semantics of the dev Glue job:
-
-  * posexplode               - the dev explode, zero-based leg_pos
-  * planneditinerary[i]      - the dev prev_leg/next_leg lookups (NULL out of range)
-  * array_position(...)      - the dev sequence number, null-safe struct equality
-  * to_date/to_timestamp     - the dev date/timestamp parsing and TZ handling
-  * <=>                      - null-safe equality for the comparison
-  * dates/timestamps are NOT defaulted on parse failure, mirroring the dev
-    na.fill behaviour (string fills don't apply to date/timestamp columns)
-
-The pure-SQL text of the summary query also lives in
-cmdty_crgo_pln_leg_validation_sparksql.sql for pasting into a %%sql cell.
-
-Where to run:
-  * Athena Spark workgroup notebook: paste into a cell, then
-        run_validation(spark).show(vertical=True, truncate=False)
-  * Glue job / Glue interactive session: runs as-is via the __main__ block.
-
-Output: one summary row (counts + one mismatch counter per non-identity
-field: +1 per key-matched row that differs, +0 on match). run_detail()
-returns the row-level mismatches side by side.
-"""
-
-from pyspark.sql import DataFrame, SparkSession
-
-SOURCE_TBL = "datalake_prod1_entp_ctds.cmdty_crgo_curated"
-TARGET_TBL = "datalake_prod1_entp_ctds.cmdty_crgo_pln_leg"
-BEG_DT = "2026-05-20"
-END_DT = "2026-06-07"
-
-WITH_BLOCK = """
+-- ============================================================================
+-- cmdty_crgo_pln_leg validation : ONE big Spark SQL query
+--
+-- Dialect: Spark SQL (NOT Athena/Trino SQL). Run it where Spark runs:
+--   * Athena Spark workgroup notebook: paste into a %%sql cell, or
+--     spark.sql(open('this file').read()).show(vertical=True)
+--   * Glue job / Glue interactive session: spark.sql(...)
+--
+-- Because it executes on Spark, every expression uses the dev job's exact
+-- engine semantics (posexplode, array_position null-safe struct equality,
+-- to_date/to_timestamp parsing, <=> null-safe comparison).
+--
+-- Generated from cmdty_crgo_pln_leg_validation_pyspark.py - edit there.
+-- Output: ONE summary row (source/target counts, matched/missing/extra, and
+-- one mismatch_<field> counter per non-identity field: +1 per differing
+-- key-matched row, +0 on match).
+-- ============================================================================
 WITH
 -- ----------------------------------------------------------------------------
 -- 1) EXTRACT: same event filter as metadata['cmdty_crgo_pln_leg'].extract_filter
 -- ----------------------------------------------------------------------------
 source AS (
     SELECT *
-    FROM {source_tbl}
+    FROM datalake_prod1_entp_ctds.cmdty_crgo_curated
     WHERE event_name IN (
         'piece-created', 'piece-itinerary-changed', 'piece-wab-added',
         'piece-wab-changed', 'piece-loaded-on-flight', 'piece-unloaded-from-flight',
@@ -49,7 +31,7 @@ source AS (
     )
     AND planneditinerary IS NOT NULL
     AND size(planneditinerary) > 0
-    AND to_date(airwaybillcreationdate) BETWEEN DATE '{beg_dt}' AND DATE '{end_dt}'
+    AND to_date(airwaybillcreationdate) BETWEEN DATE '2026-05-20' AND DATE '2026-06-07'
 ),
 
 -- ----------------------------------------------------------------------------
@@ -143,8 +125,8 @@ actual AS (
         eff_fm_cent_tz,
         pln_crgo_leg_seq_num, pln_max_crgo_leg_seq_num,
         pln_crgo_dep_ld_flag, pln_crgo_arr_unld_flag, cmdty_flt_leg_type_cde
-    FROM {target_tbl}
-    WHERE air_wb_cre_dt BETWEEN DATE '{beg_dt}' AND DATE '{end_dt}'
+    FROM datalake_prod1_entp_ctds.cmdty_crgo_pln_leg
+    WHERE air_wb_cre_dt BETWEEN DATE '2026-05-20' AND DATE '2026-06-07'
 ),
 
 -- ----------------------------------------------------------------------------
@@ -182,16 +164,14 @@ joined AS (
         AND s.eff_fm_cent_tz       <=> t.eff_fm_cent_tz
         AND s.pln_crgo_leg_seq_num <=> t.pln_crgo_leg_seq_num
 )
-"""
 
-SUMMARY_SELECT = """
 -- ----------------------------------------------------------------------------
 -- 6) SUMMARY: counts + one mismatch counter per non-identity field
 --    (match adds 0, mismatch adds 1)
 -- ----------------------------------------------------------------------------
 SELECT
-    DATE '{beg_dt}' AS beg_dt,
-    DATE '{end_dt}' AS end_dt,
+    DATE '2026-05-20' AS beg_dt,
+    DATE '2026-06-07' AS end_dt,
     SUM(CASE WHEN s_present THEN 1 ELSE 0 END) AS source_logical_count,
     SUM(CASE WHEN t_present THEN 1 ELSE 0 END) AS target_logical_count,
     SUM(CASE WHEN s_present AND t_present THEN 1 ELSE 0 END) AS matched_on_keys,
@@ -228,61 +208,3 @@ SELECT
               AND NOT (s_cmdty_flt_leg_type_cde <=> t_cmdty_flt_leg_type_cde)
              THEN 1 ELSE 0 END) AS mismatch_cmdty_flt_leg_type_cde
 FROM joined
-"""
-
-DETAIL_SELECT = """
--- Row-level drill-down: the mismatching rows side by side
-SELECT *
-FROM joined
-WHERE s_present AND t_present AND (
-       NOT (s_opng_carr_cde            <=> t_opng_carr_cde)
-    OR NOT (s_opng_flt_num             <=> t_opng_flt_num)
-    OR NOT (s_opng_flt_num_sufx_txt    <=> t_opng_flt_num_sufx_txt)
-    OR NOT (s_flt_dep_dt               <=> t_flt_dep_dt)
-    OR NOT (s_leg_orig_arpt_cde        <=> t_leg_orig_arpt_cde)
-    OR NOT (s_leg_dest_arpt_cde        <=> t_leg_dest_arpt_cde)
-    OR NOT (s_pln_max_crgo_leg_seq_num <=> t_pln_max_crgo_leg_seq_num)
-    OR NOT (s_pln_crgo_dep_ld_flag     <=> t_pln_crgo_dep_ld_flag)
-    OR NOT (s_pln_crgo_arr_unld_flag   <=> t_pln_crgo_arr_unld_flag)
-    OR NOT (s_cmdty_flt_leg_type_cde   <=> t_cmdty_flt_leg_type_cde)
-)
-LIMIT 1000
-"""
-
-
-def _render(sql: str, beg_dt: str, end_dt: str) -> str:
-    return sql.format(
-        source_tbl=SOURCE_TBL,
-        target_tbl=TARGET_TBL,
-        beg_dt=beg_dt,
-        end_dt=end_dt,
-    )
-
-
-def summary_sql(beg_dt: str = BEG_DT, end_dt: str = END_DT) -> str:
-    """The full one-big-SQL-query text (paste into a %%sql cell if preferred)."""
-    return _render(WITH_BLOCK + SUMMARY_SELECT, beg_dt, end_dt)
-
-
-def detail_sql(beg_dt: str = BEG_DT, end_dt: str = END_DT) -> str:
-    return _render(WITH_BLOCK + DETAIL_SELECT, beg_dt, end_dt)
-
-
-def run_validation(spark: SparkSession,
-                   beg_dt: str = BEG_DT,
-                   end_dt: str = END_DT) -> DataFrame:
-    """One-row summary: counts + per-field mismatch counters."""
-    return spark.sql(summary_sql(beg_dt, end_dt))
-
-
-def run_detail(spark: SparkSession,
-               beg_dt: str = BEG_DT,
-               end_dt: str = END_DT) -> DataFrame:
-    """Row-level mismatches side by side (s_ = derived, t_ = target)."""
-    return spark.sql(detail_sql(beg_dt, end_dt))
-
-
-if __name__ == "__main__":
-    spark = SparkSession.builder.appName("cmdty_crgo_pln_leg_validation").getOrCreate()
-    run_validation(spark).show(truncate=False, vertical=True)
-    run_detail(spark).show(50, truncate=False)
